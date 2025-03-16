@@ -17,6 +17,8 @@
 #include "nvs_flash.h"
 #include "rgb_led_e-puck2.h"
 #include "button_e-puck2.h"
+#include "esp_netif.h"
+#include "esp_mac.h"
 
 
 /*******************************************************
@@ -40,6 +42,7 @@ static bool is_running = true;
 static bool is_mesh_connected = false;
 static mesh_addr_t mesh_parent_addr;
 static int mesh_layer = -1;
+static esp_netif_t *netif_sta = NULL;
 
 mesh_light_ctl_t light_on = {
     .cmd = MESH_CONTROL_CMD,
@@ -82,7 +85,7 @@ void esp_mesh_p2p_tx_main(void *arg)
             ESP_LOGI(MESH_TAG, "layer:%d, rtableSize:%d, %s", mesh_layer,
                      esp_mesh_get_routing_table_size(),
                      (is_mesh_connected && esp_mesh_is_root()) ? "ROOT" : is_mesh_connected ? "NODE" : "DISCONNECT");
-            vTaskDelay(10 * 1000 / portTICK_RATE_MS);
+            vTaskDelay(pdMS_TO_TICKS(10 * 1000));
             continue;
         }
         esp_mesh_get_routing_table((mesh_addr_t *) &route_table,
@@ -122,7 +125,7 @@ void esp_mesh_p2p_tx_main(void *arg)
         }
         /* if route_table_size is less than 10, add delay to avoid watchdog in this task. */
         if (route_table_size < 10) {
-            vTaskDelay(5 * 1000 / portTICK_RATE_MS);
+            vTaskDelay(pdMS_TO_TICKS(5 * 1000));
         }
     }
     vTaskDelete(NULL);
@@ -203,7 +206,7 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(MESH_TAG, "<MESH_EVENT_CHILD_CONNECTED>aid:%d, "MACSTR"",
                  child_connected->aid,
                  MAC2STR(child_connected->mac));
-		esp_mesh_comm_p2p_start();
+        esp_mesh_comm_p2p_start();
     }
     break;
     case MESH_EVENT_CHILD_DISCONNECTED: {
@@ -248,7 +251,7 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         mesh_connected_indicator(mesh_layer);
         is_mesh_connected = true;
         if (esp_mesh_is_root()) {
-            tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+            esp_netif_dhcpc_start(netif_sta);
         }
         esp_mesh_comm_p2p_start();
     }
@@ -371,37 +374,41 @@ void ip_event_handler(void *arg, esp_event_base_t event_base,
                       int32_t event_id, void *event_data)
 {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-    ESP_LOGI(MESH_TAG, "<IP_EVENT_STA_GOT_IP>IP:%s", ip4addr_ntoa(&event->ip_info.ip));
+    ESP_LOGI(MESH_TAG, "<IP_EVENT_STA_GOT_IP>IP:" IPSTR, IP2STR(&event->ip_info.ip));
 }
 
 void app_main(void)
 {
-	rgb_init();
-	// RGB handling task.
-	xTaskCreatePinnedToCore(rgb_task, "rgb_task", 2048, NULL, 4, NULL, 0);
+    rgb_init();
+    // RGB handling task.
+    xTaskCreatePinnedToCore(rgb_task, "rgb_task", 2048, NULL, 4, NULL, 0);
 
-	button_init();
-	//// Button handling task.
-	//xTaskCreatePinnedToCore(button_task, "button_task", 2048, NULL, 4, NULL, 0);  	
+    button_init();
+    //// Button handling task.
+    //xTaskCreatePinnedToCore(button_task, "button_task", 2048, NULL, 4, NULL, 0);      
 
     //ESP_ERROR_CHECK(mesh_light_init());
     ESP_ERROR_CHECK(nvs_flash_init());
-    /*  tcpip initialization */
-    tcpip_adapter_init();
-    /* for mesh
-     * stop DHCP server on softAP interface by default
-     * stop DHCP client on station interface by default
-     * */
-    ESP_ERROR_CHECK(tcpip_adapter_dhcps_stop(TCPIP_ADAPTER_IF_AP));
-    ESP_ERROR_CHECK(tcpip_adapter_dhcpc_stop(TCPIP_ADAPTER_IF_STA));
-    /*  event initialization */
+    
+    /*  Initialize TCP/IP */
+    ESP_ERROR_CHECK(esp_netif_init());
+    
+    /*  Create default event loop */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    /*  wifi initialization */
+    
+    /*  Create network interfaces for mesh (only station instance saved for further manipulation, soft AP instance ignored) */
+    ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
+    
+    /*  WiFi initialization */
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&config));
+    
+    /*  Register IP event handler */
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
+    
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
     ESP_ERROR_CHECK(esp_wifi_start());
+    
     /*  mesh initialization */
     ESP_ERROR_CHECK(esp_mesh_init());
     ESP_ERROR_CHECK(esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID, &mesh_event_handler, NULL));
@@ -409,63 +416,66 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(1));
     ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(10));
     mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
+    
     /* mesh ID */
     memcpy((uint8_t *) &cfg.mesh_id, MESH_ID, 6);
+    
     /* router */
-	/*
+    /*
     cfg.channel = CONFIG_MESH_CHANNEL;
     cfg.router.ssid_len = strlen(CONFIG_MESH_ROUTER_SSID);
     memcpy((uint8_t *) &cfg.router.ssid, CONFIG_MESH_ROUTER_SSID, cfg.router.ssid_len);
     memcpy((uint8_t *) &cfg.router.password, CONFIG_MESH_ROUTER_PASSWD,
            strlen(CONFIG_MESH_ROUTER_PASSWD));
-	*/
-	ESP_ERROR_CHECK(esp_mesh_fix_root(true));
-	if(button_is_pressed()) {
-		ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));	
-	} else {
-		ESP_ERROR_CHECK(esp_mesh_fix_root(true));
-	}	
-	
-	/* RSSI parameters */
-	// The RSSI threshold can be adapted to your needs in order to increase/decrease the distance at which the robots will connect to each other or will connect to the router.
-	// For example to find a parent you need to set the "mesh_switch_parent_t.select_rssi" threshold: this is the starting threshold, parents with lower RSSI will be discarded.
-	// The parent search is done more or less like this: 
-	// 1) start scanning with "select_rssi" threshold
-	// 2) scan for at most 5 times
-	// 2.1) if parent with correct RSSI found, then connect
-	// 2.2) if no parents found or parents with lower RSSI found, then decrease by 5 the threshold (at minimum "mesh_rssi_threshold_t.low") and goto 2
-	// 2.3) if minimum threshold (=mesh_rssi_threshold_t.low) reached, then restart from "select_rssi" and goto 2
-	// For instance with mesh_switch_parent_t.select_rssi=-80, mesh_rssi_threshold_t.low=-90, parent=-89:
-	// scan with rssi=-80 for 5 times => parent too distant (rssi=-89)
-	// scan with rssi=-85 for 5 times => parent too distant (rssi=-89)
-	// scan with rssi=-90 => parent found
-	// It's worth notice that these thresholds are used when for network formation (scanning and connecting) and not for disconnection between nodes.
-	// This means that once two nodes are connected, they can communicate at a larger distance, independently of these thresholds values.
-	// For more information refer to: https://github.com/espressif/esp-idf/blob/master/components/esp_wifi/include/esp_mesh_internal.h#L44
-	// and to: https://github.com/espressif/esp-idf/blob/master/components/esp_wifi/include/esp_mesh_internal.h#L54
-	mesh_switch_parent_t default_params;
-	esp_mesh_get_switch_parent_paras(&default_params);
-	ESP_LOGI(MESH_TAG, "duration_ms=%d", default_params.duration_ms);
-	ESP_LOGI(MESH_TAG, "cnx_rssi=%d", default_params.cnx_rssi);
-	ESP_LOGI(MESH_TAG, "select_rssi=%d", default_params.select_rssi);
-	ESP_LOGI(MESH_TAG, "switch_rssi=%d", default_params.switch_rssi);
-	ESP_LOGI(MESH_TAG, "backoff_rssi=%d", default_params.backoff_rssi);	
-	default_params.select_rssi = -45;
-	//default_params.switch_rssi = -45;
-	//default_params.cnx_rssi = -45;
-	//default_params.duration_ms = 5000; // The minimal value here is 5000
-	//default_params.backoff_rssi = -45;
-	ESP_ERROR_CHECK(esp_mesh_set_switch_parent_paras(&default_params));		
-	mesh_rssi_threshold_t default_threshold;
-	esp_mesh_get_rssi_threshold(&default_threshold);
-	ESP_LOGI(MESH_TAG, "high=%d", default_threshold.high);
-	//ESP_LOGI(MESH_TAG, "medium=%d", default_threshold.medium);
-	//ESP_LOGI(MESH_TAG, "low=%d", default_threshold.low);	
-	default_threshold.low = -45;
-	default_threshold.medium = -45;
-	default_threshold.high = -45;
-	ESP_ERROR_CHECK(esp_mesh_set_rssi_threshold(&default_threshold));
-	
+    */
+    
+    ESP_ERROR_CHECK(esp_mesh_fix_root(true));
+    if(button_is_pressed()) {
+        ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));    
+    } else {
+        ESP_ERROR_CHECK(esp_mesh_fix_root(true));
+    }    
+    
+    /* RSSI parameters */
+    // The RSSI threshold can be adapted to your needs in order to increase/decrease the distance at which the robots will connect to each other or will connect to the router.
+    // For example to find a parent you need to set the "mesh_switch_parent_t.select_rssi" threshold: this is the starting threshold, parents with lower RSSI will be discarded.
+    // The parent search is done more or less like this: 
+    // 1) start scanning with "select_rssi" threshold
+    // 2) scan for at most 5 times
+    // 2.1) if parent with correct RSSI found, then connect
+    // 2.2) if no parents found or parents with lower RSSI found, then decrease by 5 the threshold (at minimum "mesh_rssi_threshold_t.low") and goto 2
+    // 2.3) if minimum threshold (=mesh_rssi_threshold_t.low) reached, then restart from "select_rssi" and goto 2
+    // For instance with mesh_switch_parent_t.select_rssi=-80, mesh_rssi_threshold_t.low=-90, parent=-89:
+    // scan with rssi=-80 for 5 times => parent too distant (rssi=-89)
+    // scan with rssi=-85 for 5 times => parent too distant (rssi=-89)
+    // scan with rssi=-90 => parent found
+    // It's worth notice that these thresholds are used when for network formation (scanning and connecting) and not for disconnection between nodes.
+    // This means that once two nodes are connected, they can communicate at a larger distance, independently of these thresholds values.
+    // For more information refer to: https://github.com/espressif/esp-idf/blob/master/components/esp_wifi/include/esp_mesh_internal.h#L44
+    // and to: https://github.com/espressif/esp-idf/blob/master/components/esp_wifi/include/esp_mesh_internal.h#L54
+    mesh_switch_parent_t default_params;
+    esp_mesh_get_switch_parent_paras(&default_params);
+    ESP_LOGI(MESH_TAG, "duration_ms=%d", default_params.duration_ms);
+    ESP_LOGI(MESH_TAG, "cnx_rssi=%d", default_params.cnx_rssi);
+    ESP_LOGI(MESH_TAG, "select_rssi=%d", default_params.select_rssi);
+    ESP_LOGI(MESH_TAG, "switch_rssi=%d", default_params.switch_rssi);
+    ESP_LOGI(MESH_TAG, "backoff_rssi=%d", default_params.backoff_rssi);    
+    default_params.select_rssi = -45;
+    //default_params.switch_rssi = -45;
+    //default_params.cnx_rssi = -45;
+    //default_params.duration_ms = 5000; // The minimal value here is 5000
+    //default_params.backoff_rssi = -45;
+    ESP_ERROR_CHECK(esp_mesh_set_switch_parent_paras(&default_params));        
+    mesh_rssi_threshold_t default_threshold;
+    esp_mesh_get_rssi_threshold(&default_threshold);
+    ESP_LOGI(MESH_TAG, "high=%d", default_threshold.high);
+    //ESP_LOGI(MESH_TAG, "medium=%d", default_threshold.medium);
+    //ESP_LOGI(MESH_TAG, "low=%d", default_threshold.low);    
+    default_threshold.low = -45;
+    default_threshold.medium = -45;
+    default_threshold.high = -45;
+    ESP_ERROR_CHECK(esp_mesh_set_rssi_threshold(&default_threshold));
+    
     /* mesh softAP */
     ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
     cfg.mesh_ap.max_connection = CONFIG_MESH_AP_CONNECTIONS;
@@ -476,8 +486,4 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_mesh_start());
     ESP_LOGI(MESH_TAG, "mesh starts successfully, heap:%d, %s\n",  esp_get_free_heap_size(),
              esp_mesh_is_root_fixed() ? "root fixed" : "root not fixed");
-			 
-
-	
-	
 }
